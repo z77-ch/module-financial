@@ -1,0 +1,146 @@
+<?php
+/**
+ * Add / edit an account or a group. The number is fixed once the account
+ * exists — settings and postings name accounts by number; the field is
+ * read-only on edit and the controller never passes it on. There is no
+ * delete: an account is deactivated on the list row.
+ *
+ * FIN-TYPE-001: a locked type (a line in a closed period) and «Bebuchbar»
+ * of an account with lines are shown DISABLED with the reason — a disabled
+ * select is not submitted, so the stored value stays. The server refuses
+ * the change regardless; this only spares the round trip.
+ *
+ * «Auf Belegen wählbar» (owner 2026-10-12) is shown for a revenue account
+ * and on «Konto anlegen» (the type is chosen in the same form); on any other
+ * type it is not rendered, so nothing is posted and the stored value stays —
+ * it is ignored there (`Account::$selectableOnDocuments`). Its explanation
+ * stands in the label like every field of this dialog: the dialog is a
+ * modal popup, beside which the non-modal help window cannot be used.
+ *
+ * «Nur durch Module bebuchbar» (owner 2026-10-13, `Account::$modulePostingOnly`) is shown
+ * for a postable account and on «Konto anlegen»: a manual journal entry is refused on such
+ * an account, a module's posting passes. Not rendered for a group — nothing is posted, the
+ * stored value stays.
+ *
+ * @var \Z77\Module\Financial\Entities\Account $entry
+ * @var string $entityCsrf
+ * @var \Z77\Persistence\Validation\EntityValidator $validator
+ * @var array<string,string> $typeLabels
+ * @var list<\Z77\Module\Financial\Entities\Account> $groups  the groups a parent may be chosen from
+ * @var array{type: bool, postable: bool} $locks  what the journal locks (`AccountService::postingLocks()`)
+ * @var string|null $storedType  the STORED type — a locked (disabled) select shows it, not a refused draft's
+ * @var string $actionBase
+ */
+$isNew      = $entry->getId() === null;
+$actionBase = $actionBase ?? '/backend/finance/account';
+$parentId   = $entry->getParent()?->getId();
+$locks      = $locks ?? ['type' => false, 'postable' => false];
+$shownType  = $locks['type'] ? ($storedType ?? $entry->getType()) : $entry->getType();
+
+$fieldError = function (string $name) use ($validator): string {
+    return $validator->hasFieldError($name)
+        ? '<small class="be-form__field-error" data-z77-field-error>' . e($validator->getFieldError($name)) . '</small>'
+        : '';
+};
+?>
+<form data-fetch-post="<?= e($actionBase) ?>/<?= $isNew ? 'add' : 'edit?id=' . e((string) $entry->getId()) ?>">
+    <?php if (!$isNew): ?>
+    <input type="hidden" name="entity_csrf" value="<?= e($entityCsrf) ?>">
+    <?php endif; ?>
+    <div class="be-modal__header">
+        <h2 class="be-modal__title"><?= $isNew ? 'Konto anlegen' : 'Konto «' . e($entry->label()) . '» bearbeiten' ?></h2>
+    </div>
+    <?= $this->partial('partials/modalActions', ['submit' => 'Speichern'], 'Z77\\Shared') ?>
+    <div class="be-modal__body">
+        <?php if ($validator->hasErrors()): ?>
+        <div class="be-modal__alert be-modal__alert--error">
+            <?php foreach ($validator->getErrors() as $error): ?>
+            <div><?= e($error) ?></div>
+            <?php endforeach; ?>
+            Bitte überprüfe die markierten Eingaben.
+        </div>
+        <?php endif; ?>
+        <div class="be-form__grid">
+            <div class="be-form__field" data-z77-field-wrapper>
+                <label>Kontonummer <small>(nur Ziffern<?= $isNew ? '' : ' — nach dem Anlegen fix' ?>)</small></label>
+                <input type="text" name="number" value="<?= e($entry->getNumber()) ?>" maxlength="10" inputmode="numeric" autocomplete="off"
+                       placeholder="z.B. 1020"<?= $isNew ? ' required' : ' readonly' ?>
+                       aria-invalid="<?= $validator->hasFieldError('number') ? 'true' : 'false' ?>">
+                <?= raw($fieldError('number')) ?>
+            </div>
+            <div class="be-form__field" data-z77-field-wrapper>
+                <label>Bezeichnung</label>
+                <input type="text" name="name" value="<?= e($entry->getName()) ?>" maxlength="120" required autocomplete="off"
+                       placeholder="z.B. Bankguthaben"
+                       aria-invalid="<?= $validator->hasFieldError('name') ? 'true' : 'false' ?>">
+                <?= raw($fieldError('name')) ?>
+            </div>
+        </div>
+        <div class="be-form__grid">
+            <div class="be-form__field" data-z77-field-wrapper>
+                <label>Kontoart <small>(Bilanz: Aktiven, Fremdkapital, Eigenkapital — Erfolgsrechnung: Aufwand, Ertrag)</small></label>
+                <select name="type" required<?= $locks['type'] ? ' disabled' : '' ?> aria-invalid="<?= $validator->hasFieldError('type') ? 'true' : 'false' ?>">
+                    <?php foreach ($typeLabels as $value => $label): ?>
+                    <option value="<?= e($value) ?>"<?= $shownType === $value ? ' selected' : '' ?>><?= e($label) ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <?php if ($locks['type'] && !$validator->hasFieldError('type')): ?>
+                <small><?= e(\Z77\Module\Financial\Validators\AccountValidator::TYPE_LOCKED) ?></small>
+                <?php endif; ?>
+                <?= raw($fieldError('type')) ?>
+            </div>
+            <div class="be-form__field" data-z77-field-wrapper>
+                <label>Bebuchbar <small>(eine Gruppe sammelt Konten und trägt keine Buchungen)</small></label>
+                <select name="postable"<?= $locks['postable'] ? ' disabled' : '' ?> aria-invalid="<?= $validator->hasFieldError('postable') ? 'true' : 'false' ?>">
+                    <option value="1"<?= $entry->isPostable() ? ' selected' : '' ?>>Ja — Konto</option>
+                    <?php if (!$locks['postable']): ?>
+                    <option value="0"<?= $entry->isPostable() ? '' : ' selected' ?>>Nein — Gruppe</option>
+                    <?php endif; ?>
+                </select>
+                <?php if ($locks['postable'] && !$validator->hasFieldError('postable')): ?>
+                <small><?= e(\Z77\Module\Financial\Validators\AccountValidator::POSTABLE_LOCKED) ?></small>
+                <?php endif; ?>
+                <?= raw($fieldError('postable')) ?>
+            </div>
+        </div>
+        <div class="be-form__grid">
+            <div class="be-form__field" data-z77-field-wrapper>
+                <label>Gruppe <small>(übergeordnet)</small></label>
+                <select name="parent_id" aria-invalid="<?= $validator->hasFieldError('parent') ? 'true' : 'false' ?>">
+                    <option value="0"<?= $parentId === null ? ' selected' : '' ?>>– keine (oberste Ebene) –</option>
+                    <?php foreach ($groups as $group): ?>
+                    <option value="<?= e((string) $group->getId()) ?>"<?= $parentId === $group->getId() ? ' selected' : '' ?>><?= e($group->label()) ?><?= $group->isActive() ? '' : ' (inaktiv)' ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <?= raw($fieldError('parent')) ?>
+            </div>
+        </div>
+        <?php if ($isNew || $shownType === \Z77\Module\Financial\Entities\AccountType::Revenue->value): ?>
+        <div class="be-form__grid">
+            <div class="be-form__field" data-z77-field-wrapper>
+                <label class="be-switch">
+                    <input type="checkbox" class="be-switch__input" name="selectable_on_documents" value="1"<?= $entry->isSelectableOnDocuments() ? ' checked' : '' ?>>
+                    <span class="be-switch__track"><span class="be-switch__thumb"></span></span>
+                    <span class="be-switch__label">Auf Belegen wählbar <small>(nur Kontoart Ertrag: wird als Konto einer Rechnungs- oder Gutschriftsposition angeboten — aus für Erlösminderungen, Verluste, Rundung)</small></span>
+                </label>
+                <?= raw($fieldError('selectable_on_documents')) ?>
+            </div>
+        </div>
+        <?php endif; ?>
+        <?php // «Nur durch Module bebuchbar» (owner 2026-10-13): for a postable account and on
+              // «Konto anlegen»; a group carries no line, so the switch is not rendered there and
+              // the stored value stays. The help stands in the label (the modal popup, see above). ?>
+        <?php if ($isNew || $entry->isPostable()): ?>
+        <div class="be-form__grid">
+            <div class="be-form__field" data-z77-field-wrapper>
+                <label class="be-switch">
+                    <input type="checkbox" class="be-switch__input" name="module_posting_only" value="1"<?= $entry->isModulePostingOnly() ? ' checked' : '' ?>>
+                    <span class="be-switch__track"><span class="be-switch__thumb"></span></span>
+                    <span class="be-switch__label">Nur durch Module bebuchbar <small>(Sammelkonto eines Moduls, z. B. Debitoren 1100: manuelle Buchungen im Journal werden abgelehnt, nur das Modul bucht darauf — Korrekturen über das Modul; der Jahresabschluss gleicht das Konto mit dem Modul ab)</small></span>
+                </label>
+                <?= raw($fieldError('module_posting_only')) ?>
+            </div>
+        </div>
+        <?php endif; ?>
+    </div>
+</form>

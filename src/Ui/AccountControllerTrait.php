@@ -1,0 +1,386 @@
+<?php
+namespace Z77\Module\Financial\Ui;
+
+use Z77\Core\DI,
+    Z77\Shared\Attributes\Csrf,
+    Z77\Core\Http\Response\FetchResponse,
+    Z77\Core\Http\Response\HtmlResponse,
+    Z77\Core\Services\TemplateRenderer,
+    Z77\Module\Financial\Entities\Account,
+    Z77\Module\Financial\Entities\AccountType,
+    Z77\Module\Financial\Repositories\AccountRepository,
+    Z77\Module\Financial\Services\AccountNumberChangedException,
+    Z77\Module\Financial\Services\AccountService,
+    Z77\Module\Financial\Services\ChartNotEmptyException,
+    Z77\Module\Financial\Services\InvalidAccountException,
+    Z77\Module\Financial\Validators\AccountValidator,
+    Z77\Persistence\Cleaning\BodyCleaner,
+    Z77\Shared\Attributes\Fetch,
+    Z77\Shared\Attributes\HttpMethod
+;
+
+/**
+ * The chart-of-accounts surface (plan §5.1) — mounted by a thin host
+ * controller in the backend (ADR-018 pattern, like the tax codes next to
+ * it): the host provides route + auth + shell, all logic and templates live
+ * here in module-financial. Host side: `use AccountControllerTrait` + a
+ * one-line layout config delegating to {@see AccountLayout::config()}.
+ *
+ * What the screen can do, and deliberately cannot:
+ *
+ *   - list the chart in number order, indented by its groups;
+ *   - add an account or a group; edit name, type, group and «bebuchbar» —
+ *     the NUMBER is fixed once the account exists; the TYPE once a line of
+ *     it lies in a closed period, and «bebuchbar» cannot be switched off
+ *     once it carries lines (FIN-TYPE-001 — the form disables the select
+ *     and says why; the service refuses regardless); on a revenue account
+ *     also «auf Belegen wählbar» (owner 2026-10-12 — the list marks a
+ *     revenue account that is NOT offered on documents);
+ *   - activate / deactivate (inline switch). There is NO delete: journal
+ *     lines reference an account;
+ *   - «KMU-Kontenrahmen übernehmen» — offered ONLY while the chart is empty
+ *     (owner, 2026-09-22); the service refuses it otherwise.
+ *
+ * Every write goes through {@see AccountService}; a MANAGED account is
+ * never mutated here before validation (ADR-039 decision 9) — the cleaned
+ * values go to the service, a refused change comes back as the exception's
+ * draft. No JavaScript of its own (shared `core.js` wiring). The using class
+ * MUST provide (via its host base): `html()`, `fetch()`, `fetchError()`,
+ * `em()`, `$layoutManager`, `$messageService`, `$help` (the list's help, ADR-048).
+ */
+trait AccountControllerTrait
+{
+    private const ACCOUNT_NS = 'Z77\\Module\\Financial';
+
+    /** German display labels — PRESENTATION ONLY (the `ROLE_LABELS` pattern). The type SET is {@see AccountType}. */
+    private const ACCOUNT_TYPE_LABELS = [
+        'asset'     => 'Aktiven',
+        'liability' => 'Fremdkapital',
+        'equity'    => 'Eigenkapital',
+        'expense'   => 'Aufwand',
+        'revenue'   => 'Ertrag',
+    ];
+
+    /** URL root of THIS mount — every row button and modal form is built from it. */
+    protected function accountListBase(): string
+    {
+        return '/backend/finance/account';
+    }
+
+    private function accounts(): AccountRepository
+    {
+        return $this->em()->getRepository(Account::class);
+    }
+
+    private function accountService(): AccountService
+    {
+        return new AccountService($this->em());
+    }
+
+    /** @return array<string,string> type value → German label, for selects and the list */
+    private function accountTypeLabels(): array
+    {
+        $labels = [];
+        foreach (AccountType::cases() as $type) {
+            $labels[$type->value] = self::ACCOUNT_TYPE_LABELS[$type->value] ?? $type->value;
+        }
+
+        return $labels;
+    }
+
+    /**
+     * The form's values, cleaned (`postable` comes from a select, `1` / `0`).
+     * `number` only for a new account (fixed
+     * afterwards), `active` never (own switch), and the group arrives as
+     * `parent_id` and is resolved to the entity — a raw `parent` key from
+     * the body is dropped.
+     *
+     * @return array<string, mixed>|string the values, or an error message
+     */
+    private function accountValues(array $body, bool $isNew): array|string
+    {
+        $values = BodyCleaner::cleanFor(Account::class, $body);
+        unset($values['id'], $values['active'], $values['parent']);
+        if (!$isNew) {
+            unset($values['number']);
+        }
+
+        $parentId = (int) ($body['parent_id'] ?? 0);
+        if ($parentId === 0) {
+            $values['parent'] = null;
+        } else {
+            $parent = $this->accounts()->find($parentId);
+            if ($parent === null) {
+                return 'Übergeordnete Gruppe nicht gefunden';
+            }
+            $values['parent'] = $parent;
+        }
+
+        return $values;
+    }
+
+    // ── list ─────────────────────────────────────────────────────────────
+
+    protected function listAction(): HtmlResponse
+    {
+        $accounts = $this->accounts()->allInOrder();
+        // The list's help (ADR-048, HELP-003: at the right end of the toolbar) — it also explains the
+        // add / edit dialog, a modal beside which the help window cannot be used.
+        $this->help->attach('Backend/AccountController/list.help', self::ACCOUNT_NS, [], 'Hilfe: Kontenplan', toolbar: true);
+        $response = $this->html([
+            'accounts'   => $accounts,
+            'depths'     => self::accountDepths($accounts),
+            'typeLabels' => $this->accountTypeLabels(),
+            'actionBase' => $this->accountListBase(),
+        ]);
+        // The fragment owns its header slot (financial.md, «fragment slots»). The add action is the
+        // entry's most frequent action, so it goes into the action cell (ADR-033 rev. 2026-10-08).
+        $this->layoutManager->addPartials('addButton', 'Backend/AccountController', self::ACCOUNT_NS, 'hc1');
+
+        return $response;
+    }
+
+    /**
+     * How deep each account sits in its group chain (0 = top) — the list's
+     * indentation. Walks parents already in the Identity Map.
+     *
+     * @param list<Account> $accounts
+     * @return array<int, int> account id → depth
+     */
+    private static function accountDepths(array $accounts): array
+    {
+        $depths = [];
+        foreach ($accounts as $account) {
+            $depth = 0;
+            for ($p = $account->getParent(); $p !== null && $depth < 32; $p = $p->getParent()) {
+                $depth++;
+            }
+            $depths[(int) $account->getId()] = $depth;
+        }
+
+        return $depths;
+    }
+
+    // ── add / edit ───────────────────────────────────────────────────────
+
+    /**
+     * «Konto anlegen» — nothing is managed before the service persists it, so the entity is built from the body.
+     *
+     * `#[Csrf]`: the global check covers Fetch POSTs only, and this body arrives the same without the
+     * fetch header (security.md, page-mode POST). core.js sends the token as a header, so the form works.
+     */
+    #[Csrf]
+    protected function addAction(): HtmlResponse|FetchResponse
+    {
+        $account   = new Account(['type' => AccountType::Asset->value]);
+        $validator = null;
+
+        if (DI::getRequest()->isPost()) {
+            $values = $this->accountValues(DI::getRequest()->getJsonBody(), true);
+            if (is_string($values)) {
+                return $this->fetchError($values);
+            }
+            $account->mapFromArray($values);
+
+            try {
+                $this->accountService()->save($account);
+                $this->messageService->pushFlash('success', 'Konto «' . $account->label() . '» angelegt');
+
+                // The chart is in number order: the new row goes before the account that follows it.
+                $next = null;
+                $all  = $this->accounts()->allInOrder();
+                foreach ($all as $i => $candidate) {
+                    if ($candidate->getId() === $account->getId()) {
+                        $next = $all[$i + 1] ?? null;
+                    }
+                }
+                $list = FetchResponse::listTarget('account');
+
+                return $this->fetch()
+                    ->setStatus('success')
+                    ->setData(['id' => $account->getId()])
+                    ->insertRow('account', $this->accountRowHtml($account), $next === null ? 'append' : 'before', '',
+                        $next === null ? null : FetchResponse::rowTarget('account', (int) $next->getId()))
+                    // The empty chart's note and its KMU offer go with the first account (both `<p>`; rows are `<div>`).
+                    ->addCommand('remove-element', ['target' => $list . ' > .be-list__empty'])
+                    ->addCommand('remove-element', ['target' => $list . ' > p'])
+                    ->addCommand('close-modal');
+            } catch (InvalidAccountException $e) {
+                $validator = $e->validator;
+            }
+        }
+
+        return $this->renderAccountForm($account, $validator, null);
+    }
+
+    /**
+     * «Konto bearbeiten»: the managed account is NOT mutated here — the
+     * cleaned values go to `AccountService::update()`, which validates a
+     * detached draft first. On refusal the draft is what the form shows.
+     */
+    protected function editAction(): HtmlResponse|FetchResponse
+    {
+        $id      = (int) DI::getRequest()->getGetParameter('id');
+        $account = $id ? $this->accounts()->find($id) : null;
+        if ($account === null) {
+            return $this->fetchError('Konto nicht gefunden');
+        }
+        $shown     = $account;
+        $validator = null;
+
+        if (DI::getRequest()->isPost()) {
+            $body = DI::getRequest()->getJsonBody();
+            if (!DI::getCsrfService()->validateEntityToken(trim((string) ($body['entity_csrf'] ?? '')), 'account', $account->getId())) {
+                return $this->fetchError('Invalid token');
+            }
+            $values = $this->accountValues($body, false);
+            if (is_string($values)) {
+                return $this->fetchError($values);
+            }
+
+            $parentBefore = $account->getParent()?->getId();
+            try {
+                $this->accountService()->update($account, $values);
+
+                // A GROUP moved to another group takes its whole subtree to a new depth: the
+                // chart changes shape, so that one case reloads. A postable account has no
+                // children — its row alone changes depth (the list is in number order, so its
+                // position stays) and answers in place like every other edit.
+                if (!$account->isPostable() && $account->getParent()?->getId() !== $parentBefore) {
+                    $this->messageService->pushFlashAfterRedirect('success', 'Konto «' . $account->label() . '» gespeichert');
+
+                    return $this->fetch()
+                        ->setStatus('success')
+                        ->setData(['id' => $account->getId()])
+                        ->addCommand('close-modal')
+                        ->addCommand('reload');
+                }
+                $this->messageService->pushFlash('success', 'Konto «' . $account->label() . '» gespeichert');
+
+                return $this->accountRowAnswer($account)->addCommand('close-modal');
+            } catch (InvalidAccountException $e) {
+                $validator = $e->validator;
+                $shown     = $e->draft;
+            } catch (AccountNumberChangedException) {
+                return $this->fetchError('Die Kontonummer ist nach dem Anlegen fix — für eine andere Nummer ein neues Konto anlegen.');
+            }
+        }
+
+        return $this->renderAccountForm($shown, $validator, $account);
+    }
+
+    /**
+     * @param Account|null $stored the account on edit — excluded from the group select. Compared
+     *        BY ID: after a refusal under the account lock the unit of work rolled back and the
+     *        EntityManager was replaced, so the objects of the first read are detached.
+     */
+    private function renderAccountForm(Account $shown, ?AccountValidator $validator, ?Account $stored): HtmlResponse
+    {
+        $isNew    = $shown->getId() === null;
+        $storedId = $stored?->getId();
+        $parentId = $shown->getParent()?->getId();
+        $groups   = [];
+        foreach ($this->accounts()->allInOrder() as $candidate) {
+            if ($candidate->isPostable() || ($storedId !== null && $candidate->getId() === $storedId)) {
+                continue;
+            }
+            // Active groups are offered; an inactive one only when it is the current group.
+            if ($candidate->isActive() || $candidate->getId() === $parentId) {
+                $groups[] = $candidate;
+            }
+        }
+        // FIN-TYPE-001: what the journal locks, read from the STORED account (not the draft) —
+        // re-read by id, the object handed in may be detached after a refusal under the lock.
+        $current = $storedId === null ? null : ($this->accounts()->find($storedId) ?? $stored);
+        $locks   = $current === null ? ['type' => false, 'postable' => false] : $this->accountService()->postingLocks($current);
+
+        $response = $this->html([
+            'entry'      => $shown,
+            'entityCsrf' => $isNew ? '' : DI::getCsrfService()->generateEntityToken('account', $shown->getId()),
+            'validator'  => $validator ?? new AccountValidator($shown),
+            'typeLabels' => $this->accountTypeLabels(),
+            'groups'     => $groups,
+            'locks'      => $locks,
+            'storedType' => $current?->getType(),
+            'actionBase' => $this->accountListBase(),
+        ]);
+        $this->layoutManager->addPartials('edit', 'Backend/AccountController', self::ACCOUNT_NS);
+
+        return $response;
+    }
+
+    // ── active switch ────────────────────────────────────────────────────
+
+    /** Inline switch on the list row (`data-fetch-toggle`, session CSRF via header). */
+    #[Fetch, HttpMethod('POST')]
+    protected function toggleActiveAction(): FetchResponse
+    {
+        $id      = (int) DI::getRequest()->getGetParameter('id');
+        $account = $id ? $this->accounts()->find($id) : null;
+        if ($account === null) {
+            return $this->fetchError('Konto nicht gefunden');
+        }
+
+        $body = DI::getRequest()->getJsonBody();
+        try {
+            $this->accountService()->setActive($account, (bool) ($body['value'] ?? !$account->isActive()));
+        } catch (InvalidAccountException) {
+            return $this->fetchError('Konto ist unvollständig — zuerst bearbeiten.');
+        }
+
+        return $this->accountRowAnswer($account);
+    }
+
+    /**
+     * A save that changed one account row answers with that row, not with `reload` (ADR-047
+     * addendum 2026-10-10): `_row` — the partial the list renders — replaces the row in place.
+     * Push the flash BEFORE calling: `fetch()` takes the in-place flash buffer when it is built.
+     */
+    private function accountRowAnswer(Account $account): FetchResponse
+    {
+        return $this->fetch()
+            ->setStatus('success')
+            ->setData(['id' => $account->getId()])
+            ->replaceRow('account', (int) $account->getId(), $this->accountRowHtml($account));
+    }
+
+    /** The account's chart row, rendered by the list's own partial, at its depth in the group chain. */
+    private function accountRowHtml(Account $account): string
+    {
+        return (new TemplateRenderer(self::ACCOUNT_NS))->partial('Backend/AccountController/_row', [
+            'account'    => $account,
+            'depth'      => self::accountDepths([$account])[(int) $account->getId()] ?? 0,
+            'typeLabels' => $this->accountTypeLabels(),
+            'actionBase' => $this->accountListBase(),
+        ]);
+    }
+
+    // ── KMU chart ────────────────────────────────────────────────────────
+
+    /** Confirmation modal for «KMU-Kontenrahmen übernehmen» — only while the chart is empty. */
+    protected function confirmAdoptKmuChartAction(): HtmlResponse|FetchResponse
+    {
+        if (!$this->accounts()->isEmpty()) {
+            return $this->fetchError('Der Kontenplan ist nicht leer — der KMU-Kontenrahmen wird nur in einen leeren Kontenplan übernommen.');
+        }
+
+        $response = $this->html(['actionBase' => $this->accountListBase()]);
+        $this->layoutManager->addPartials('confirmAdoptKmuChart', 'Backend/AccountController', self::ACCOUNT_NS);
+
+        return $response;
+    }
+
+    #[Fetch, HttpMethod('POST')]
+    protected function adoptKmuChartAction(): FetchResponse
+    {
+        try {
+            $created = $this->accountService()->adoptKmuChart();
+        } catch (ChartNotEmptyException) {
+            return $this->fetchError('Der Kontenplan ist nicht leer — der KMU-Kontenrahmen wird nur in einen leeren Kontenplan übernommen.');
+        }
+        $this->messageService->pushFlashAfterRedirect('success', 'KMU-Kontenrahmen übernommen: ' . $created . ' Konten und Gruppen');
+
+        // A bulk fill of the empty chart — the whole list is new, a reload is the honest answer.
+        return $this->fetch()->setStatus('success')->addCommand('close-modal')->addCommand('reload');
+    }
+}
